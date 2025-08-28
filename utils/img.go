@@ -7,44 +7,55 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/disintegration/imaging"
+	"github.com/google/uuid"
 )
 
-// ImageSizeField holds the data for a single resized image.
-type ImageSizeField struct {
-	Width  int
-	Height int
-	URL    string
-}
-
-// ImageSizes holds the data for all resized versions of an image.
-type ImageSizes struct {
-	Small  *ImageSizeField
-	Medium *ImageSizeField
-	Large  *ImageSizeField
-}
-
-// Define constants for image resizing
+// Define constants for image processing
 const (
-	UploadPath  = "public/uploads"
-	URLPrefix   = "/uploads"
-	SmallWidth  = 320
-	MediumWidth = 640
-	LargeWidth  = 1024
+	UploadPath     = "public/uploads"
+	MainWidth      = 1024 // Max width for the main image
+	ThumbnailWidth = 300  // Width for the thumbnail
 )
+
+// ProcessedImageResult holds the data after processing an uploaded image.
+type ProcessedImageResult struct {
+	BlurURL      string
+	URL          string
+	ThumbnailURL string
+	Width        int
+	Height       int
+}
 
 // BlurImage generates a small, blurred base64-encoded data URI for a given image.
-func BlurImage(src image.Image) (string, error) {
+// It uses the provided width and height if specified, otherwise defaults to a small thumbnail.
+func BlurImage(src image.Image, width int, height *int) (string, error) {
 	if src == nil {
 		return "", errors.New("source image is nil")
 	}
 
-	thumbnail := imaging.Thumbnail(src, 100, 100, imaging.Lanczos)
-	blurImage := imaging.Blur(thumbnail, 5)
+	var blurWidth, blurHeight int
+	if height != nil {
+		blurWidth = width
+		blurHeight = *height
+	} else {
+		bounds := src.Bounds()
+		origW := bounds.Dx()
+		origH := bounds.Dy()
+		blurWidth = width
+		blurHeight = int(float64(origH) * float64(blurWidth) / float64(origW))
+		if blurHeight < 1 {
+			blurHeight = 1
+		}
+	}
+
+	thumbnail := imaging.Resize(src, blurWidth, blurHeight, imaging.Lanczos)
+	blurImage := imaging.Blur(thumbnail, 30)
 
 	buf := new(bytes.Buffer)
 	if err := jpeg.Encode(buf, blurImage, &jpeg.Options{Quality: 30}); err != nil {
@@ -59,75 +70,66 @@ func BlurImage(src image.Image) (string, error) {
 	return "data:image/jpeg;base64," + base64Str, nil
 }
 
-// saveResizedImage saves a resized image with a placeholder .avif extension.
-func saveResizedImage(img image.Image, originalFilename, sizeName string, width int) (*ImageSizeField, error) {
+func ProcessAndSaveImage(src io.Reader, originalFilename string) (*ProcessedImageResult, error) {
+	// Decode the image
+	img, _, err := image.Decode(src)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	blurURL, err := BlurImage(img, MainWidth, nil)
+	if err != nil {
+		// Log the error but don't fail the whole process
+		fmt.Printf("Warning: failed to generate blur image for %s: %v\n", originalFilename, err)
+	}
+
 	ext := filepath.Ext(originalFilename)
-	baseName := strings.TrimSuffix(originalFilename, ext)
-	// New filename with .avif extension
-	newFilename := fmt.Sprintf("%s-%s.avif", baseName, sizeName)
+	baseName := strings.TrimSuffix(filepath.Base(originalFilename), ext)
+	uuid, err := uuid.NewRandom()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate uuid: %w", err)
+	}
+	uniqueBaseName := fmt.Sprintf("%s-%s", baseName, strings.Replace(uuid.String(), "-", "", -1))
 
 	if err := os.MkdirAll(UploadPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create upload directory: %w", err)
 	}
 
-	dstPath := filepath.Join(UploadPath, newFilename)
+	mainImg := imaging.Resize(img, MainWidth, 0, imaging.Lanczos)
+	mainFilename := uniqueBaseName + ".jpg"
+	mainPath := filepath.Join(UploadPath, mainFilename)
 
-	// Resize image
-	resizedImg := imaging.Resize(img, width, 0, imaging.Lanczos)
+	mainFile, err := os.Create(mainPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file for main image: %w", err)
+	}
+	defer mainFile.Close()
 
-	// NOTE: This saves the image in JPEG format but with an .avif extension.
-	// A real AVIF encoder (e.g., from a library like github.com/Kagami/go-avif)
-	// should be used here for proper conversion.
-	if err := imaging.Save(resizedImg, dstPath); err != nil {
-		return nil, fmt.Errorf("failed to save (placeholder) AVIF image %s: %w", dstPath, err)
+	if err := jpeg.Encode(mainFile, mainImg, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, fmt.Errorf("failed to encode main image to jpeg: %w", err)
 	}
 
-	bounds := resizedImg.Bounds()
-	urlPath := strings.ReplaceAll(filepath.ToSlash(filepath.Join(URLPrefix, newFilename)), "\\", "/")
+	thumbImg := imaging.Resize(img, ThumbnailWidth, 0, imaging.Lanczos)
+	thumbFilename := uniqueBaseName + "_thumb.jpg"
+	thumbPath := filepath.Join(UploadPath, thumbFilename)
 
-	return &ImageSizeField{
-		Width:  bounds.Dx(),
-		Height: bounds.Dy(),
-		URL:    urlPath,
+	thumbFile, err := os.Create(thumbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file for thumbnail image: %w", err)
+	}
+	defer thumbFile.Close()
+
+	if err := jpeg.Encode(thumbFile, thumbImg, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, fmt.Errorf("failed to encode thumbnail to jpeg: %w", err)
+	}
+
+	bounds := mainImg.Bounds()
+
+	return &ProcessedImageResult{
+		BlurURL:      blurURL,
+		URL:          "/" + strings.ReplaceAll(mainPath, "\\", "/"),
+		ThumbnailURL: "/" + strings.ReplaceAll(thumbPath, "\\", "/"),
+		Width:        bounds.Dx(),
+		Height:       bounds.Dy(),
 	}, nil
-}
-
-// ResizeImage takes an image, resizes it to different sizes, and saves them as placeholder AVIF files.
-func ResizeImage(src image.Image, originalFilename string) (*ImageSizes, error) {
-	if src == nil {
-		return nil, errors.New("source image is nil")
-	}
-	if originalFilename == "" {
-		return nil, errors.New("original filename is empty")
-	}
-
-	imageSizes := &ImageSizes{}
-	var errorStrings []string
-
-	// Small
-	smallField, err := saveResizedImage(src, originalFilename, "small", SmallWidth)
-	if err != nil {
-		errorStrings = append(errorStrings, err.Error())
-	}
-	imageSizes.Small = smallField
-
-	// Medium
-	mediumField, err := saveResizedImage(src, originalFilename, "medium", MediumWidth)
-	if err != nil {
-		errorStrings = append(errorStrings, err.Error())
-	}
-	imageSizes.Medium = mediumField
-
-	// Large
-	largeField, err := saveResizedImage(src, originalFilename, "large", LargeWidth)
-	if err != nil {
-		errorStrings = append(errorStrings, err.Error())
-	}
-	imageSizes.Large = largeField
-
-	if len(errorStrings) > 0 {
-		return imageSizes, errors.New(strings.Join(errorStrings, "; "))
-	}
-
-	return imageSizes, nil
 }
