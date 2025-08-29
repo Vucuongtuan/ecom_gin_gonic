@@ -50,7 +50,7 @@ func TemplateHTML(templateHtml, data interface{}) (string, error) {
 }
 
 // SendMail sends an email using net/smtp
-func SendMail(to []string, subject, body string) error {
+func SendMail(to []string, subject string) error {
 	auth := smtp.PlainAuth("", SMTP_EMAIL, SMTP_PASS, SMTP_HOST)
 	body, err := TemplateHTML(ConfirmTemplate, map[string]string{
 		"name":        "Vu Cuong",
@@ -71,5 +71,6 @@ func SendMail(to []string, subject, body string) error {
 		body,
 	))
 	addr := fmt.Sprintf("%s:%s", SMTP_HOST, SMTP_PORT)
-	return smtp.SendMail(addr, auth, SMTP_EMAIL, to, msg)
+	smtp.SendMail(addr, auth, SMTP_EMAIL, to, msg)
+	return nil
 }
